@@ -343,8 +343,17 @@ void zmk_input_listener_ps2_layer_toggle_deactivate_layer(struct k_work *item) {
 // of waiting for layer-toggle-timeout-ms. Only a single PS/2 listener
 // instance with layer-toggle configured is supported (matches this driver's
 // existing assumption of one pointing device).
+//
+// IMPORTANT: zmk_position_state_changed is raised *before* ZMK resolves and
+// invokes the behavior bound to that key position. Deactivating the layer
+// synchronously from this listener would make ZMK resolve the binding
+// against the now-inactive layer, breaking the very keypress that triggered
+// it (e.g. a click on the mouse layer would stop registering as a click).
+// So we only schedule the deactivation here, and let it run on the system
+// workqueue after the current keypress has already been dispatched.
 static struct input_listener_ps2_data *layer_toggle_exit_data = NULL;
 static const struct input_listener_ps2_config *layer_toggle_exit_config = NULL;
+static struct k_work_delayable layer_toggle_exit_work;
 
 static bool input_listener_ps2_position_is_excluded(const struct input_listener_ps2_config *config,
                                                      uint32_t position) {
@@ -354,6 +363,15 @@ static bool input_listener_ps2_position_is_excluded(const struct input_listener_
         }
     }
     return false;
+}
+
+static void input_listener_ps2_layer_toggle_exit_work_cb(struct k_work *work) {
+    if (layer_toggle_exit_data != NULL && layer_toggle_exit_config != NULL &&
+        layer_toggle_exit_data->layer_toggle_layer_enabled) {
+        LOG_INF("Deactivating layer %d due to earlier key press at non-excluded position",
+                layer_toggle_exit_config->layer_toggle);
+        input_listener_ps2_layer_toggle_deactivate_now(layer_toggle_exit_config, layer_toggle_exit_data);
+    }
 }
 
 static int
@@ -373,9 +391,8 @@ input_listener_ps2_position_state_changed_listener(const zmk_event_t *eh) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-    LOG_INF("Deactivating layer %d due to key press at excluded position %d",
-            layer_toggle_exit_config->layer_toggle, ev->position);
-    input_listener_ps2_layer_toggle_deactivate_now(layer_toggle_exit_config, layer_toggle_exit_data);
+    // Defer to the workqueue - see the big comment above.
+    k_work_schedule(&layer_toggle_exit_work, K_NO_WAIT);
 
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -389,6 +406,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                           zmk_input_listener_ps2_layer_toggle_activate_layer);
     k_work_init_delayable(&data->layer_toggle_deactivation_delay,
                           zmk_input_listener_ps2_layer_toggle_deactivate_layer);
+    k_work_init_delayable(&layer_toggle_exit_work, input_listener_ps2_layer_toggle_exit_work_cb);
 
     if (config->layer_toggle != -1) {
         layer_toggle_exit_data = data;
