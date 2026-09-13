@@ -19,6 +19,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/keymap.h>
 #include <zmk/pointing.h>
 #include <zmk/hid.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/position_state_changed.h>
 
 #define ZMK_MOUSE_HID_NUM_BUTTONS 5
 
@@ -70,6 +72,8 @@ struct input_listener_ps2_config {
     int layer_toggle_delay_ms;
     int layer_toggle_timeout_ms;
     int scroll_layer;
+    const uint8_t *excluded_positions;
+    size_t excluded_positions_len;
 };
 
 void zmk_input_listener_ps2_layer_toggle_input_rel_received(
@@ -311,14 +315,9 @@ void zmk_input_listener_ps2_layer_toggle_activate_layer(struct k_work *item) {
     }
 }
 
-void zmk_input_listener_ps2_layer_toggle_deactivate_layer(struct k_work *item) {
-    struct k_work_delayable *d_work = k_work_delayable_from_work(item);
-
-    struct input_listener_ps2_data *data =
-        CONTAINER_OF(d_work, struct input_listener_ps2_data, layer_toggle_deactivation_delay);
-    const struct input_listener_ps2_config *config = data->dev->config;
-
-    LOG_INF("Deactivating layer %d due to mouse activity...", config->layer_toggle);
+static void input_listener_ps2_layer_toggle_deactivate_now(
+    const struct input_listener_ps2_config *config, struct input_listener_ps2_data *data) {
+    k_work_cancel_delayable(&data->layer_toggle_deactivation_delay);
 
     if (zmk_keymap_layer_active(config->layer_toggle)) {
         zmk_keymap_layer_deactivate(config->layer_toggle);
@@ -327,12 +326,74 @@ void zmk_input_listener_ps2_layer_toggle_deactivate_layer(struct k_work *item) {
     data->layer_toggle_layer_enabled = false;
 }
 
+void zmk_input_listener_ps2_layer_toggle_deactivate_layer(struct k_work *item) {
+    struct k_work_delayable *d_work = k_work_delayable_from_work(item);
+
+    struct input_listener_ps2_data *data =
+        CONTAINER_OF(d_work, struct input_listener_ps2_data, layer_toggle_deactivation_delay);
+    const struct input_listener_ps2_config *config = data->dev->config;
+
+    LOG_INF("Deactivating layer %d due to mouse inactivity...", config->layer_toggle);
+
+    input_listener_ps2_layer_toggle_deactivate_now(config, data);
+}
+
+// Exit-on-keypress: pressing any key position that isn't in excluded-positions
+// while the layer-toggle layer is active deactivates it immediately, instead
+// of waiting for layer-toggle-timeout-ms. Only a single PS/2 listener
+// instance with layer-toggle configured is supported (matches this driver's
+// existing assumption of one pointing device).
+static struct input_listener_ps2_data *layer_toggle_exit_data = NULL;
+static const struct input_listener_ps2_config *layer_toggle_exit_config = NULL;
+
+static bool input_listener_ps2_position_is_excluded(const struct input_listener_ps2_config *config,
+                                                     uint32_t position) {
+    for (size_t i = 0; i < config->excluded_positions_len; i++) {
+        if (config->excluded_positions[i] == position) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int
+input_listener_ps2_position_state_changed_listener(const zmk_event_t *eh) {
+    if (layer_toggle_exit_data == NULL || layer_toggle_exit_config == NULL ||
+        !layer_toggle_exit_data->layer_toggle_layer_enabled) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+    if (ev == NULL || !ev->state) {
+        // Ignore key releases, only react to presses.
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    if (input_listener_ps2_position_is_excluded(layer_toggle_exit_config, ev->position)) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    LOG_INF("Deactivating layer %d due to key press at excluded position %d",
+            layer_toggle_exit_config->layer_toggle, ev->position);
+    input_listener_ps2_layer_toggle_deactivate_now(layer_toggle_exit_config, layer_toggle_exit_data);
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(input_listener_ps2_position, input_listener_ps2_position_state_changed_listener);
+ZMK_SUBSCRIPTION(input_listener_ps2_position, zmk_position_state_changed);
+
 static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_ps2_config *config,
                                                     struct input_listener_ps2_data *data) {
     k_work_init_delayable(&data->layer_toggle_activation_delay,
                           zmk_input_listener_ps2_layer_toggle_activate_layer);
     k_work_init_delayable(&data->layer_toggle_deactivation_delay,
                           zmk_input_listener_ps2_layer_toggle_deactivate_layer);
+
+    if (config->layer_toggle != -1) {
+        layer_toggle_exit_data = data;
+        layer_toggle_exit_config = config;
+    }
 
     return 0;
 }
@@ -342,6 +403,10 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
 #define IL_INST(n)                                                                                 \
     COND_CODE_1(DT_NODE_HAS_STATUS(DT_INST_PHANDLE(n, device), okay),                              \
                 (                                                                                  \
+                    COND_CODE_1(DT_INST_NODE_HAS_PROP(n, excluded_positions),                      \
+                        (static const uint8_t excluded_positions_##n[] =                           \
+                             DT_INST_PROP(n, excluded_positions);),                                \
+                        (static const uint8_t excluded_positions_##n[] = {0};))                    \
                     static const struct input_listener_ps2_config config_##n =                     \
                         {                                                                          \
                             .xy_swap = DT_INST_PROP(n, xy_swap),                                   \
@@ -353,6 +418,9 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .layer_toggle_delay_ms = DT_INST_PROP(n, layer_toggle_delay_ms),       \
                             .layer_toggle_timeout_ms = DT_INST_PROP(n, layer_toggle_timeout_ms),   \
                             .scroll_layer = DT_INST_PROP(n, scroll_layer),                         \
+                            .excluded_positions = excluded_positions_##n,                          \
+                            .excluded_positions_len =                                              \
+                                DT_INST_PROP_LEN_OR(n, excluded_positions, 0),                      \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \

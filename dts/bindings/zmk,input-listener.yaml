@@ -39,3 +39,11 @@ properties:
     default: -1
     required: false
     description: The layer index that activates scroll mode when it is the highest active layer.
+  excluded-positions:
+    type: array
+    required: false
+    description: |
+      Key positions (zero-based) that do NOT deactivate the layer-toggle layer
+      when pressed. Pressing any other key position while the layer-toggle
+      layer is active deactivates it immediately, regardless of
+      layer-toggle-timeout-ms.
